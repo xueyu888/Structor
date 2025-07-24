@@ -19,59 +19,98 @@ from tkinter import filedialog, messagebox
 from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
+import numpy as np  # 新增
 
 # -----------------------------------------------------------------------------
 # 日志
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(levelname)-4s | %(message)s")
+# -----------------------------------------------------------------------------#
+#  通用工具 + 旧 .et 自动转换                                                  #
+# -----------------------------------------------------------------------------#
+import logging, pathlib, re, zipfile, os
+from typing import Dict, Iterable, List, Tuple
 
-# -----------------------------------------------------------------------------
-# 通用工具
-# -----------------------------------------------------------------------------
-_WS_RE = re.compile(r"[\s\u3000\r\n]+")        # 普通空格、全角空格、回车、换行
+import numpy as np
+import pandas as pd
+
+# ---------- optional COM -----------
+try:
+    import win32com.client as win32  # 仅 Windows 安装 pywin32 时成功
+except ImportError:
+    win32 = None
+
+_WS_RE = re.compile(r"[\s\u3000\r\n]+")
 
 
 def clean(s) -> str:
-    """转为 str 并去空白字符"""
     return _WS_RE.sub("", str(s).strip())
 
 
-def read_excel_auto(path: pathlib.Path, *, header=None, nrows=None) -> pd.DataFrame:
-    suf = path.suffix.lower()
-    if suf == ".xlsx":
-        return pd.read_excel(path, engine="openpyxl", header=header, nrows=nrows)
-    if suf == ".xls":
+# ---------- WPS COM 转换旧 .et ----------
+def _convert_et_via_wps(et_path: pathlib.Path) -> pathlib.Path | None:
+    """调用本机 WPS 将旧 .et 另存为 .xlsx；成功返回新路径，否则 None"""
+    if os.name != "nt" or win32 is None:
+        return None
+    try:
+        xl_path = et_path.with_suffix(".xlsx")
+        app = win32.DispatchEx("ET.Application")
+        app.Visible = False
+        app.DisplayAlerts = False
+        wb = app.Workbooks.Open(str(et_path))
+        wb.SaveAs(str(xl_path), FileFormat=51)  # 51 = xlOpenXMLWorkbook
+        wb.Close(False)
+        app.Quit()
+        return xl_path if xl_path.exists() else None
+    except Exception as e:
+        logging.warning(f"自动转换 {et_path.name} 失败: {e}")
+        return None
+
+
+# ---------- 统一读取 ----------
+def read_excel_auto(
+    path: pathlib.Path,
+    *,
+    header: int | None = 0,
+    nrows: int | None = None,
+    sheet_name: str | int | List | None = 0,
+):
+    kw = dict(header=header, nrows=nrows, sheet_name=sheet_name)
+    ext = path.suffix.lower()
+
+    # .xlsx 或 新版 .et (Zip-XML)
+    if ext in {".xlsx", ".et"}:
         try:
-            return pd.read_excel(path, engine="xlrd", header=header, nrows=nrows)
+            return pd.read_excel(path, engine="openpyxl", **kw)
+        except zipfile.BadZipFile:  # 老 .et
+            xl_path = _convert_et_via_wps(path)
+            if xl_path:
+                return pd.read_excel(xl_path, engine="openpyxl", **kw)
+            raise RuntimeError(
+                f"{path.name} 为旧版二进制 .et，且自动转换失败；"
+                "请在 WPS 中另存为 .xlsx 再运行合并"
+            )
+
+    # .xls
+    if ext == ".xls":
+        try:
+            return pd.read_excel(path, engine="xlrd", **kw)
         except ImportError as exc:
-            raise RuntimeError('读取 .xls 需安装:  pip install "xlrd<2.0.0"') from exc
+            raise RuntimeError('读取 .xls 需安装: pip install "xlrd<2.0.0"') from exc
+
     raise ValueError(f"不支持的文件类型: {path}")
 
 
-# -----------------------------------------------------------------------------
-# 核心合并器（保持与 GUI 调用接口一致）
-# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------#
-#  核心合并器  ExcelTemplateMerger                                             #
+#  ExcelTemplateMerger  – backend v3.5                                         #
 # -----------------------------------------------------------------------------#
 class ExcelTemplateMerger:
-    """
-    工作流程
-    =========
-    1. 读取并解析映射文件（源→模板、模板→源 双向 dict）
-    2. **自动探测表头行**（模板文件 + 每个源文件都用同一算法）：
-         • 从上往下遍历，第一行 ≥1 单元格匹配映射键视为表头
-    3. fuzzy rename：忽略空白/全角空格/换行，支持互相包含
-    4. 对齐模板列、补缺列
-    5. 合并所有命中≥1列的 DataFrame，写出
-    """
-
-    def __init__(self, tail_rows: int = 3, probe_rows: int = 200) -> None:
+    def __init__(self, tail_rows: int = 3, probe_rows: int = 200):
         self.tail_rows = tail_rows
         self.probe_rows = probe_rows
-        self.log = logging.info  # 默认为 console，可被 GUI 注入
+        self.log = logging.info
 
-    # --------------------------- public API ---------------------------------
+    # ---------------------------- Public API --------------------------------
     def merge(
         self,
         template_path: pathlib.Path,
@@ -81,18 +120,15 @@ class ExcelTemplateMerger:
     ) -> pathlib.Path:
         self.log = log_func
 
-        fwd, rev = self._load_mapping(mapping_path)
-        # 1) 先解析模板，拿到标准列顺序
-        tpl_cols = self._load_template(template_path, fwd, rev)
+        tpl_cols, fwd, rev = self._load_mapping(mapping_path)
+        self.log(f"模板列数: {len(tpl_cols)}")
 
         frames: list[pd.DataFrame] = []
         for src in source_paths:
-            df = self._process_source(src, tpl_cols, fwd, rev)
-            if df is not None:
-                frames.append(df)
+            frames.extend(self._process_workbook(src, tpl_cols, fwd, rev))
 
         if not frames:
-            raise RuntimeError("所有源文件均未成功匹配表头，无法合并")
+            raise RuntimeError("未在任何源文件中匹配到列，无法合并")
 
         result = pd.concat(frames, ignore_index=True)
         self.log(f"合并完成, 总行数: {len(result)}")
@@ -102,59 +138,55 @@ class ExcelTemplateMerger:
         self.log(f"已写出: {out}")
         return out
 
-    # --------------------------- mapping ------------------------------------
-    def _load_mapping(self, path: pathlib.Path) -> Tuple[Dict[str, str], Dict[str, str]]:
-        df = read_excel_auto(path).fillna("")
+    # --------------------------- Mapping ------------------------------------
+    def _load_mapping(
+        self, path: pathlib.Path
+    ) -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
+        df = read_excel_auto(path, sheet_name=0).fillna("")
         if df.shape[1] < 2:
-            raise ValueError("映射文件至少包含两列：模板表头 | 源表头")
+            raise ValueError("映射文件需至少两列：模板表头 | 源表头")
 
         col_tpl, col_src = df.columns[:2]
+        tpl_cols: list[str] = []
         fwd, rev = {}, {}
         for tpl, src in zip(df[col_tpl], df[col_src]):
             t, s = clean(tpl), clean(src)
-            if t and s:
-                fwd[s] = t
-                rev[t] = s
+            if not t or not s:
+                continue
+            if t not in tpl_cols:
+                tpl_cols.append(t)
+            fwd[s] = t
+            rev[t] = s
         if not fwd:
             raise ValueError("映射文件未检测到有效映射对")
+        self.log(f"读取映射文件, 映射对 {len(fwd)}")
+        return tpl_cols, fwd, rev
 
-        self.log(f"读取映射文件, 共 {len(fwd)} 对")
-        return fwd, rev
-
-    # --------------------------- header detect ------------------------------
-    def _probe_header_row(self, df_probe: pd.DataFrame, keys: set[str]) -> Tuple[int, List[str]]:
-        """
-        按行扫描 df_probe，第一行出现 ≥1 keys 即视为表头行。
-        返回 (idx, matched_list)。若未找到 → (-1, [])。
-        """
+    # --------------------------- Header Probe -------------------------------
+    @staticmethod
+    def _probe_header_row(df_probe: pd.DataFrame, keys: set[str]) -> int:
         for i, row in df_probe.iterrows():
             cleaned = [clean(c) for c in row if pd.notna(c)]
-            matched = [c for c in cleaned if c in keys]
-            if matched:
-                return i, matched
-        return -1, []
+            if any(c in keys for c in cleaned):
+                return i
+        return -1
 
-    # --------------------------- fuzzy rename -------------------------------
+    # --------------------------- Fuzzy Rename -------------------------------
     @staticmethod
-    def _fuzzy_rename(df: pd.DataFrame, fwd: Dict[str, str], rev: Dict[str, str]) -> Tuple[pd.DataFrame, int]:
-        """
-        返回 (重命名后的 df, 命中列数)
-        逻辑：源→模板 & 模板→源 各算一遍，取命中多的一侧
-        """
+    def _fuzzy_rename(
+        df: pd.DataFrame, fwd: Dict[str, str], rev: Dict[str, str]
+    ) -> Tuple[pd.DataFrame, int]:
         pool_fwd, pool_rev = set(fwd), set(rev)
-        ren_fwd, hit_fwd = {}, 0
-        ren_rev, hit_rev = {}, 0
+        ren_fwd, hit_fwd, ren_rev, hit_rev = {}, 0, {}, 0
 
         for col in df.columns:
             c = clean(col)
             k = next((k for k in pool_fwd if c == k or k in c or c in k), None)
             if k:
-                ren_fwd[col] = fwd[k]
-                hit_fwd += 1
+                ren_fwd[col] = fwd[k]; hit_fwd += 1
             k2 = next((k for k in pool_rev if c == k or k in c or c in k), None)
             if k2:
-                ren_rev[col] = rev[k2]
-                hit_rev += 1
+                ren_rev[col] = rev[k2]; hit_rev += 1
 
         if hit_fwd >= hit_rev and hit_fwd:
             return df.rename(columns=ren_fwd), hit_fwd
@@ -162,62 +194,46 @@ class ExcelTemplateMerger:
             return df.rename(columns=ren_rev), hit_rev
         return df, 0
 
-    # --------------------------- template load ------------------------------
-    def _load_template(self, tpl_path: pathlib.Path, fwd: Dict[str, str], rev: Dict[str, str]) -> List[str]:
-        """模板也用探测逻辑，避免标题行/空行导致列名变 0…31"""
-        probe = read_excel_auto(tpl_path, header=None, nrows=self.probe_rows)
-        hdr, matched = self._probe_header_row(probe, set(fwd) | set(rev))
-        if hdr == -1:
-            raise RuntimeError("模板文件未找到任何映射列，无法确定表头行")
-
-        df_tpl = read_excel_auto(tpl_path, header=hdr)
-        df_tpl.columns = [clean(c) for c in df_tpl.columns]
-        # 如果模板列未必就是“模板表头”，也用 fuzzy_rename 把它们转成模板名
-        df_tpl, _ = self._fuzzy_rename(df_tpl, rev, fwd)  # 注意方向反过来
-        cols = [clean(c) for c in df_tpl.columns]
-        self.log(f"读取模板, 表头行 {hdr}, 列 {cols}")
-        return cols
-
-    # --------------------------- single source ------------------------------
-    def _process_source(
+    # ------------------------- Process Workbook ----------------------------
+    def _process_workbook(
         self,
-        src_path: pathlib.Path,
+        wb_path: pathlib.Path,
         tpl_cols: List[str],
         fwd: Dict[str, str],
         rev: Dict[str, str],
-    ) -> pd.DataFrame | None:
-        self.log(f"处理 {src_path.name} …")
+    ) -> List[pd.DataFrame]:
+        self.log(f"处理 {wb_path.name} …")
+        frames: list[pd.DataFrame] = []
 
-        probe = read_excel_auto(src_path, header=None, nrows=self.probe_rows)
-        hdr_row, matched = self._probe_header_row(probe, set(fwd) | set(rev))
-        if hdr_row == -1:
-            self.log("  ⚠️ 未找到任何映射表头，跳过")
-            return None
-        self.log(f"  表头行: 第 {hdr_row} 行, 初步命中 {matched}")
+        sheets = read_excel_auto(wb_path, header=None, sheet_name=None)
+        for sheet, probe_df in sheets.items():
+            hdr = self._probe_header_row(probe_df.head(self.probe_rows), set(fwd) | set(rev))
+            if hdr == -1:
+                self.log(f"  【{sheet}】未找到表头，跳过")
+                continue
 
-        df = read_excel_auto(src_path, header=hdr_row)
-        df.columns = [clean(c) for c in df.columns]
-        df, hits = self._fuzzy_rename(df, fwd, rev)
+            df = read_excel_auto(wb_path, header=hdr, sheet_name=sheet)
+            df.columns = [clean(c) for c in df.columns]
+            df, hits = self._fuzzy_rename(df, fwd, rev)
+            if hits == 0:
+                self.log(f"  【{sheet}】0 列命中，跳过")
+                continue
 
-        if hits == 0:
-            self.log("  ⚠️ 0 列命中，跳过")
-            return None
+            # 去重列名
+            _, first_idx = np.unique(df.columns, return_index=True)
+            df = df.iloc[:, sorted(first_idx)]
 
-        miss = [c for c in tpl_cols if c not in df.columns]
-        self.log(f"  命中 {hits} 列, 缺失 {len(miss)} 列")
-        if miss:
-            self.log(f"  ⚠️ 缺失模板列: {miss}")
+            # 补缺列并对齐
+            for col in tpl_cols:
+                if col not in df.columns:
+                    df[col] = pd.NA
+            frames.append(df[tpl_cols])
 
-        # 打印示例行（若有数据）
-        if not df.empty:
-            sample = df.iloc[0].to_dict()
-            self.log(f"  表头示例: {sample}")
+            self.log(f"  【{sheet}】命中 {hits}, 缺失 {len(tpl_cols) - hits} 列 | 表头行 {hdr}")
+            if not df.empty:
+                self.log(f"    示例: {df.iloc[0].to_dict()}")
 
-        # 补列并对齐
-        for col in tpl_cols:
-            if col not in df.columns:
-                df[col] = pd.NA
-        return df[tpl_cols]
+        return frames
 
 
 # -----------------------------------------------------------------------------
@@ -240,7 +256,7 @@ class ExcelMergerGUI(tk.Tk):
     def _build_widgets(self):
         pad = {"padx": 8, "pady": 4}
 
-        tk.Button(self, text="选择模板文件 (.xlsx/.xls)", command=self._sel_tpl).pack(fill="x", **pad)
+        tk.Button(self, text="选择模板文件 (.xlsx/.xls/.et)", command=self._sel_tpl).pack(fill="x", **pad)
         tk.Button(self, text="导入表头映射配置", command=self._sel_map).pack(fill="x", **pad)
 
         tk.Label(self, text="待处理文件列表:").pack(anchor="w", **pad)

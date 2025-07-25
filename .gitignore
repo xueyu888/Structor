@@ -1,0 +1,26 @@
+# __pycache__ 和临时 Python 文件
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller 输出目录
+build/
+dist/
+*.spec
+
+# 虚拟环境（如非 Poetry）
+.venv/
+env/
+venv/
+
+# VSCode 或其他 IDE 配置
+.vscode/
+.idea/
+
+# 本地日志或输出文件
+*.log
+*_filled.xlsx
+
+# Mac/Windows 临时文件
+.DS_Store
+Thumbs.db
